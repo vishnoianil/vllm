@@ -143,6 +143,8 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
 
 
 class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    _call_count: int = 0
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -167,7 +169,17 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         output_shape: list,
     ) -> torch.Tensor:
         # Fused GEMM_DQ
+        #CutlassFP8ScaledMMLinearKernel._call_count += 1
+        #start = torch.cuda.Event(enable_timing=True)
+        #end = torch.cuda.Event(enable_timing=True)
+        #start.record()
         output = ops.cutlass_scaled_mm(
             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
         )
+        #end.record()
+        #torch.cuda.synchronize()
+        #elapsed_ms = start.elapsed_time(end)
+        #print(f"cutlass_scaled_mm call #{CutlassFP8ScaledMMLinearKernel._call_count}: "
+        #      f"{elapsed_ms:.3f} ms | "
+        #      f"A={A.shape} B={B.shape} scale_a={As.shape} scale_b={Bs.shape}")
         return output.view(*output_shape)
