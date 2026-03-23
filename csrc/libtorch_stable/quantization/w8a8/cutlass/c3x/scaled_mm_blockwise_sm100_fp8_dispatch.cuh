@@ -91,8 +91,8 @@ struct cutlass_3x_gemm_fp8_blockwise {
       EpilogueScheduler,
       DefaultOperation
   >::CollectiveOp;
- 
-  using StageCountType = cutlass::gemm::collective::StageCountAuto; 
+
+  using StageCountType = cutlass::gemm::collective::StageCountAuto;
   using CollectiveMainloop = conditional_t<swap_ab,
       typename cutlass::gemm::collective::CollectiveBuilder<
           ArchTag,
@@ -162,7 +162,7 @@ void cutlass_gemm_caller_blockwise(torch::stable::Tensor& out, torch::stable::Te
   c_stride =
       cutlass::make_cute_packed_stride(StrideC{}, swap_ab ? cute::make_shape(n, m, 1) : cute::make_shape(m, n, 1));
 
-  LayoutSFA layout_SFA = swap_ab ? 
+  LayoutSFA layout_SFA = swap_ab ?
       ScaleConfig::tile_atom_to_shape_SFA(make_shape(n, m, k, 1)) :
       ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
   LayoutSFB layout_SFB = swap_ab ?

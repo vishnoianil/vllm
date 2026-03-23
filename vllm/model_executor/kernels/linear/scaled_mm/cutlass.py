@@ -150,6 +150,8 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
 
 
 class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    _call_count: int = 0
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
