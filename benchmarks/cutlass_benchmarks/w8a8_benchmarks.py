@@ -6,6 +6,7 @@ import copy
 import itertools
 import pickle as pkl
 import time
+import vllm.kernels.cutile.cutile_w8a8
 from collections.abc import Callable, Iterable
 
 import torch
@@ -112,6 +113,10 @@ def bench_fp8(
 ) -> Iterable[TMeasurement]:
     """Benchmark FP8-based kernels."""
     assert dtype == torch.float8_e4m3fn
+
+    def is_blockwise_compatible(m, n, k):
+        return m % 128 == 0 and n % 128 == 0 and k % 128 == 0
+
     a, b = make_rand_tensors(torch.float8_e4m3fn, m, n, k)
     a_cont = a.contiguous()
     scale_a = torch.tensor(1.0, device="cuda", dtype=torch.float32)
@@ -161,6 +166,9 @@ def bench_fp8(
         "triton_fp8_fp8_fp16_scaled_mm_blockwise": lambda: w8a8_triton_block_scaled_mm(
             a_cont, b.t(), block_scale_a, block_scale_b.t(), (128, 128)
         ),
+        "cutile_fp8_fp8_bf16_blockwise_mm": lambda: torch.ops.vllm.cutile_scaled_mm(
+            a, b, block_scale_a_M_major, block_scale_b_K_major, torch.bfloat16
+        ),
         "cutlass_fp8_fp8_fp16_scaled_mm_blockwise": lambda: ops.cutlass_scaled_mm(
             a, b, block_scale_a_M_major, block_scale_b_K_major, torch.float16
         ),
@@ -171,7 +179,11 @@ def bench_fp8(
         # If bench_kernels is None, run all. Otherwise, run only exact matches.
         if bench_kernels is None or name in bench_kernels:
             print(f"Running {name}")
-            timers.append(bench_fn(label, sub_label, name, fn))
+            if (name == "cutlass_fp8_fp8_fp16_scaled_mm_blockwise" and not is_blockwise_compatible(m, k, n)):
+                print(f"Skipping {name} for M={m}, K={k}, N={n} (not compatible)")
+                continue
+            else:
+                timers.append(bench_fn(label, sub_label, name, fn))
 
     return timers
 
@@ -308,13 +320,13 @@ Benchmark Cutlass GEMM.
 
     To run square GEMMs:
         python3 ./benchmarks/cutlass_benchmarks/w8a8_benchmarks.py --dtype fp8 square_bench --dim-start 128 --dim-end 512 --dim-increment 64
-    
+
     To run constant N and K and sweep M:
         python3 ./benchmarks/cutlass_benchmarks/w8a8_benchmarks.py --dtype fp8 range_bench --dim-start 128 --dim-end 512 --dim-increment 64 --n-constant 16384 --k-constant 16384
-    
+
     To run dimensions from a model:
         python3 ./benchmarks/cutlass_benchmarks/w8a8_benchmarks.py --dtype fp8 model_bench --models meta-llama/Llama-2-7b-hf --batch-sizes 16 --tp-sizes 1
-    
+
     Output:
         - a .pkl file, that is a list of raw torch.benchmark.utils.Measurements for the pytorch and cutlass implementations for the various GEMMs.
             """,  # noqa: E501

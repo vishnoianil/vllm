@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 import vllm.envs as envs
+import vllm.kernels.cutile.cutile_w8a8  # noqa: F401
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
@@ -889,6 +890,58 @@ def cutlass_scaled_mm(
     # Massage the input to be 2D
     target_shape = (*a.shape[:-1], b.shape[1])
     a = a.view(-1, a.shape[-1])
+
+    if envs.VLLM_SWITCH_CUTILE:
+        out_cutile = torch.empty((a.shape[0], b.shape[1]), dtype=out_dtype, device=a.device)
+        torch.ops.vllm.cutile_scaled_mm(out_cutile, a, b, scale_a, scale_b, bias)
+        # Compare against CUTLASS only in eager mode (torch.allclose is
+        # not traceable by dynamo because it returns a data-dependent bool).
+        if not torch.compiler.is_compiling():
+            out_cutlass = torch.empty((a.shape[0], b.shape[1]), dtype=out_dtype, device=a.device)
+            torch.ops._C.cutlass_scaled_mm(out_cutlass, a, b, scale_a, scale_b, bias)
+
+            # Print input shapes and strides for the tensors
+            print(f"Input shapes: A={a.shape}, B={b.shape}")
+            print(f"Input strides: A={a.stride()}, B={b.stride()}")
+            print(f"Scale A shape: {scale_a.shape}, Scale B shape: {scale_b.shape}")
+            print(f"Scale A strides: {scale_a.stride()}, Scale B strides: {scale_b.stride()}")
+            print(f"Output dtype: {out_dtype}")
+            print(f"Bias shape: {bias.shape if bias is not None else None}")
+            print(f"Output shape: {out_cutile.shape}")
+            print(f"Output strides: {out_cutile.stride()}")
+            print(f"Output shape (cutlass): {out_cutlass.shape}")
+            print(f"Output strides (cutlass): {out_cutlass.stride()}")
+
+            #print layout of all the tensors
+            print(f"Input A layout: {a.layout}, Input B layout: {b.layout}, Scale A layout: {scale_a.layout}, Scale B layout: {scale_b.layout}")
+
+            #print data types of all the tensors
+            print(f"Input A dtype: {a.dtype}, Input B dtype: {b.dtype}, Scale A dtype: {scale_a.dtype}, Scale B dtype: {scale_b.dtype}")
+
+            print(f"Bias dtype: {bias.dtype if bias is not None else None}, Bias layout: {bias.layout if bias is not None else None}")
+
+            # Print the input tensors, scales and also the output
+            print(f"Input A: {a}")
+            print(f"Input B: {b}")
+            print(f"Scale A: {scale_a}")
+            print(f"Scale B: {scale_b}")
+            if bias is not None:
+                print(f"Bias: {bias}")
+            print(f"Output (cutile): {out_cutile}")
+            print(f"Output (cutlass): {out_cutlass}")
+            print(f"Difference between cutile and cutlass output: {torch.abs(out_cutile.to(torch.float32) - out_cutlass.to(torch.float32))}")
+            
+
+            rel_diff = torch.mean(torch.abs(out_cutile.to(torch.float32) - out_cutlass.to(torch.float32))) / torch.mean(torch.abs(out_cutlass.to(torch.float32)))
+            print(
+                    f"Max difference between cutile and reference implementation: {rel_diff}"
+                )
+            if rel_diff > 1e-2:
+                raise ValueError(
+                    "Cutile scaled_mm output does not match reference implementation"
+                )
+
+        return out_cutile.view(*target_shape)
 
     cutlass_compatible_b = b.shape[0] % 16 == 0 and b.shape[1] % 16 == 0
     if current_platform.is_rocm() or not cutlass_compatible_b:
