@@ -13,18 +13,23 @@ scales.  The dispatch layer pre-combines ``scale_a * scale_b`` into an
 ``(M, N)`` tensor which is fused into the kernel epilogue via partition_C,
 eliminating any post-kernel scaling passes.
 
-Uses ``from_dlpack`` + ``mark_compact_shape_dynamic`` for zero-copy
-wrapping of PyTorch GPU tensors as dynamic-layout CuTe tensors at runtime.
-
-Kernels are JIT-compiled on first use and cached for subsequent calls.
+Uses fake_tensor and fake_stream to JIT-compile kernels with dynamic layouts to
+pass torch tensors directly to CuTe DSL without any data copies. The compiled 
+kernels are cached for reuse across multiple calls with the same
+tile/cluster/dtype configuration. Kernels are JIT-compiled on first use and 
+cached for subsequent calls.
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
-import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+
+from vllm.kernels.quantization.cutedsl.scaled_mm_sm90_fp8 import ScaledMmSm90Fp8Kernel
+from vllm.kernels.quantization.cutedsl.scaled_mm_sm90_int8 import ScaledMmSm90Int8Kernel
 
 logger = logging.getLogger(__name__)
 
@@ -51,24 +56,6 @@ class _KernelCache:
 
 _kernel_cache = _KernelCache()
 
-# CuTe tensor caches — keyed by (data_ptr, shape, dtype) so the CuTe
-# wrapper (from_dlpack + dynamic-layout marking) can be computed once and
-# reused for subsequent calls with the same tensor, saving ~5 C++ interop
-# calls per cached hit.
-_weight_cute_cache: dict[int, object] = {}
-_cute_tensor_cache: dict[tuple, object] = {}
-
-
-def _get_or_wrap_cute(pt_tensor: torch.Tensor) -> object:
-    """Return a cached CuTe dynamic-layout tensor, or create and cache one."""
-    key = (pt_tensor.data_ptr(), pt_tensor.shape, pt_tensor.dtype)
-    cached = _cute_tensor_cache.get(key)
-    if cached is not None:
-        return cached
-    ct = _to_cute_dynamic(pt_tensor)
-    _cute_tensor_cache[key] = ct
-    return ct
-
 
 # PyTorch <-> CUTLASS dtype helpers
 _TORCH_TO_CUTLASS: dict[torch.dtype, object] = {}
@@ -90,7 +77,7 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
 
 
 def _opt_level() -> int:
-    """Select nvcc optimisation level for CuTe DSL compilation."""
+    """Select nvcc optimization level for CuTe DSL compilation."""
     try:
         from cutlass import CUDA_VERSION
         if (CUDA_VERSION.major < 13
@@ -104,29 +91,19 @@ def _opt_level() -> int:
 # Kernel compilation helpers
 def _compile_kernel(
     is_fp8: bool,
-    tile_mn: Tuple[int, int],
-    cluster_mn: Tuple[int, int],
+    tile_mn: tuple[int, int],
+    cluster_mn: tuple[int, int],
     template_m: int,
     template_n: int,
     template_k: int,
     out_dtype_torch: torch.dtype,
 ):
     """JIT-compile a CuTe DSL scaled MM kernel and return the callable."""
-    import cutlass
-    import cutlass.cute as cute
-    import cutlass.torch as cutlass_torch
-
     if is_fp8:
-        from vllm.kernels.quantization.cutedsl.scaled_mm_sm90_fp8 import (
-            ScaledMmSm90Fp8Kernel,
-        )
         ab_dtype = cutlass.Float8E4M3FN
         acc_dtype = cutlass.Float32
         KernelClass = ScaledMmSm90Fp8Kernel
     else:
-        from vllm.kernels.quantization.cutedsl.scaled_mm_sm90_int8 import (
-            ScaledMmSm90Int8Kernel,
-        )
         ab_dtype = cutlass.Int8
         acc_dtype = cutlass.Int32
         KernelClass = ScaledMmSm90Int8Kernel
@@ -134,63 +111,51 @@ def _compile_kernel(
     c_dtype = _cutlass_dtype(out_dtype_torch)
     scale_dtype = cutlass.Float32
 
-    # Create template tensors for compilation with is_dynamic_layout=True
+    # Create fake template tensors for compilation with is_dynamic_layout=True
     # so the compiled kernel works for any M, N, K at runtime.
-    m = max(template_m, tile_mn[0])
-    n = max(template_n, tile_mn[1])
-    k = max(template_k, 128)
-    l = 1
+    # m = max(template_m, tile_mn[0])
+    # n = max(template_n, tile_mn[1])
+    # k = max(template_k, 128)
+    # l = 1
 
-    a_cpu = cutlass_torch.matrix(l, m, k, False, ab_dtype)
-    b_cpu = cutlass_torch.matrix(l, n, k, False, ab_dtype)
-    c_cpu = cutlass_torch.matrix(l, m, n, False, c_dtype)
-    sa_cpu = cutlass_torch.matrix(1, m, n, False, scale_dtype)
-    sb_cpu = cutlass_torch.matrix(1, 1, 1, False, scale_dtype)
+    m = cute.sym_int()
+    n = cute.sym_int(divisibility=16)
+    k = cute.sym_int(divisibility=16)
+    l = cute.sym_int()
 
-    a_cute, _ = cutlass_torch.cute_tensor_like(
-        a_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16)
-    b_cute, _ = cutlass_torch.cute_tensor_like(
-        b_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16)
-    c_cute, _ = cutlass_torch.cute_tensor_like(
-        c_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16)
-    sa_cute, _ = cutlass_torch.cute_tensor_like(
-        sa_cpu, scale_dtype, is_dynamic_layout=True, assumed_align=16)
-    sb_cute, _ = cutlass_torch.cute_tensor_like(
-        sb_cpu, scale_dtype, is_dynamic_layout=True, assumed_align=16)
+    # Contiguous on K
+    fake_a = make_fake_compact_tensor(
+        ab_dtype, (l, m, k), stride_order=(2, 1, 0), assumed_align=16
+    )
+    # Contiguous on N
+    fake_b = make_fake_compact_tensor(
+        ab_dtype, (l, k, n), stride_order=(2, 1, 0), assumed_align=16
+    )
+    # Contiguous on N
+    fake_c = make_fake_compact_tensor(
+        c_dtype, (l, m, n), stride_order=(2, 1, 0), assumed_align=16
+    )
+
+    fake_sa = make_fake_compact_tensor(
+        scale_dtype, (1, m, n), stride_order=(2, 1, 0), assumed_align=16
+    )
+    fake_sb = make_fake_compact_tensor(
+        scale_dtype, (1, 1, 1), stride_order=(2, 1, 0), assumed_align=16
+    )
+
+    fake_stream = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     scaled_mm = KernelClass(
         acc_dtype=acc_dtype,
         tile_shape_mn=tile_mn,
         cluster_shape_mn=cluster_mn,
     )
-
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    compiled = cute.compile(
-        scaled_mm,
-        a_cute, b_cute, c_cute, sa_cute, sb_cute, stream,
-        options=f"--opt-level {_opt_level()} --enable-tvm-ffi --ptxas-options -maxrregcount=64",
+    compiled_fn = cute.compile(
+        scaled_mm, fake_a, fake_b, fake_c, fake_sa, fake_sb, fake_stream,
+        options=f"--opt-level {_opt_level()} --enable-tvm-ffi --ptxas-options -maxrregcount=64"
     )
+    return compiled_fn
 
-    return compiled
-
-
-# Runtime tensor helpers
-def _to_cute_dynamic(pt_tensor: torch.Tensor) -> object:
-    """Wrap a PyTorch GPU tensor as a dynamic-layout CuTe tensor (zero-copy).
-
-    Uses ``from_dlpack`` for zero-copy wrapping, then
-    ``mark_compact_shape_dynamic`` on all modes to match the dynamic layout
-    produced by ``cute_tensor_like(is_dynamic_layout=True)`` at compile time.
-    """
-
-    ct = (
-        from_dlpack(pt_tensor, assumed_align=16, enable_tvm_ffi=True)
-        .mark_layout_dynamic(leading_dim=1)
-    )
-
-    return ct
 
 # PyTorch custom op - raw GEMM only, opaque to torch.compile
 @torch.library.custom_op(
@@ -211,8 +176,6 @@ def _cutedsl_scaled_mm_op(
     per-token, per-channel) are pre-combined into an (M, N) scale tensor
     and fused into the kernel epilogue via partition_C.
 
-    Uses from_dlpack + mark_compact_shape_dynamic for zero-copy input
-    wrapping with dynamic layouts.  No torch.cuda.synchronize().
     """
 
     M, K = a.shape
@@ -265,28 +228,13 @@ def _cutedsl_scaled_mm_op(
         # b is (K,N) column-major from weight loading; b.t() yields a
         # contiguous (N,K) view — no data copy.  unsqueeze is also a view.
         a_3d = a.contiguous().unsqueeze(-1)
+        b_3d = b.t().unsqueeze(-1)
         c_3d = torch.empty(M, N, 1, dtype=out_dtype, device=a.device)
-
-        a_cute = _get_or_wrap_cute(a_3d)
-        c_cute = _to_cute_dynamic(c_3d)  # new alloc each call, can't cache
-
-        # B (weight) CuTe tensor is cached — weights are persistent
-        # nn.Parameters whose data pointer never changes during serving.
-        b_ptr = b.data_ptr()
-        if b_ptr in _weight_cute_cache:
-            b_cute = _weight_cute_cache[b_ptr]
-        else:
-            b_3d = b.t().unsqueeze(-1)
-            b_cute = _to_cute_dynamic(b_3d)
-            _weight_cute_cache[b_ptr] = b_cute
-
-        sc_cute = _to_cute_dynamic(scale_combined_3d)
-        # sb_cute = _to_cute_dynamic(dummy_sb)
 
         # launch kernel — use CUDA events for true GPU execution time
         torch_stream = torch.cuda.current_stream()
-        stream = cuda.CUstream(torch_stream.cuda_stream)
-        compiled(a_cute, b_cute, c_cute, sc_cute, dummy_sb, stream)
+        with torch.cuda.stream(torch_stream):
+            compiled(a_3d, b_3d, c_3d, scale_combined_3d, dummy_sb, torch_stream)
 
     return c_3d.squeeze(-1)
 
